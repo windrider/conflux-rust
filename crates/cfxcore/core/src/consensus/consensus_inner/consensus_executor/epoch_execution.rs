@@ -2,7 +2,7 @@ use super::ConsensusExecutionHandler;
 use std::{collections::BTreeSet, convert::From, sync::Arc};
 
 use alloy_rpc_types_trace::geth::GethDebugTracingOptions;
-use cfx_parameters::genesis::GENESIS_ACCOUNT_ADDRESS;
+use cfx_parameters::{genesis::GENESIS_ACCOUNT_ADDRESS, internal_contract_addresses::DA_CONTRACT_ADDRESS};
 use geth_tracer::{GethTraceWithHash, GethTracer, TxExecContext};
 use pow_types::StakingEvent;
 
@@ -221,7 +221,7 @@ impl ConsensusExecutionHandler {
         epoch_recorder: &mut EpochProcessRecorder,
     ) -> DbResult<()> {
         let BlockProcessContext {
-            epoch_context: &EpochProcessContext { on_local_pivot, .. },
+            epoch_context: &EpochProcessContext { on_local_pivot, dry_run, .. },
             block,
             block_number,
             ..
@@ -240,6 +240,41 @@ impl ConsensusExecutionHandler {
         // keep the backward compatible.
         let secondary_reward =
             self.before_block_execution(state, block_number, block)?;
+
+        // Call DA contract's finalize_epoch at the beginning of each block
+        // This matches 0G's BeginBlock behavior where DA epoch is checked and updated per block
+        if !dry_run {
+            let machine = self.machine.as_ref();
+            let env_for_finalize = self.make_block_env(block_context);
+            let spec_for_finalize = machine.spec(env_for_finalize.number, env_for_finalize.epoch_height);
+            
+            if spec_for_finalize.cipda {
+                use cfx_executor::internal_contract::InternalRefContext;
+                use cfx_executor::stack::CallStackInfo;
+                use cfx_executor::substate::Substate;
+                use cfx_executor::executive_observer::TracerTrait;
+                
+                let mut dummy_substate = Substate::new();
+                let mut dummy_callstack = CallStackInfo::default();
+                let mut dummy_tracer = ();
+                
+                let mut internal_ref_ctx = InternalRefContext {
+                    env: &env_for_finalize,
+                    spec: &spec_for_finalize,
+                    callstack: &mut dummy_callstack,
+                    state,
+                    substate: &mut dummy_substate,
+                    tracer: &mut dummy_tracer as &mut dyn TracerTrait,
+                    static_flag: false,
+                    depth: 0,
+                    machine,
+                };
+                
+                if let Err(e) = cfx_executor::internal_contract::impls::da::finalize_epoch(&mut internal_ref_ctx) {
+                    warn!("Failed to call DA finalize_epoch at block {}: {:?}", block_number, e);
+                }
+            }
+        }
 
         let mut env = self.make_block_env(block_context);
 

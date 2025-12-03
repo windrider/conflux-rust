@@ -1,5 +1,9 @@
 use crate::{
-    executive_observer::TracerTrait, stack::CallStackInfo, state::State,
+    builtin::Builtin,
+    executive_observer::TracerTrait,
+    machine::Machine,
+    stack::CallStackInfo,
+    state::State,
     substate::Substate,
 };
 use cfx_statedb::Result as DbResult;
@@ -21,6 +25,8 @@ pub struct InternalRefContext<'a> {
     pub tracer: &'a mut dyn TracerTrait,
     pub static_flag: bool,
     pub depth: usize,
+    /// Reference to the Machine so internal contracts can access builtins.
+    pub machine: &'a Machine,
 }
 
 // The following implementation is copied from `executive/context.rs`. I know
@@ -72,5 +78,35 @@ impl<'a> InternalRefContext<'a> {
 
     pub fn is_contract_address(&self, address: &Address) -> vm::Result<bool> {
         Ok(address.is_contract_address())
+    }
+
+    /// Call a builtin precompile directly from an internal contract.
+    /// This uses the same builtin lookup and execution logic as normal EVM calls,
+    /// but bypasses bytecode and directly invokes the native implementation.
+    pub fn call_builtin(
+        &mut self, address: &Address, input: &[u8],
+    ) -> vm::Result<Vec<u8>> {
+        use cfx_bytes::BytesRef;
+
+        let addr_with_space = address.with_space(self.env.space);
+        let block_number = self.env.number;
+
+        let builtin = self
+            .machine
+            .builtin(&addr_with_space, block_number)
+            .ok_or_else(|| {
+                vm::Error::InternalContract("Builtin not found at address".into())
+            })?;
+
+        let cost = builtin.cost(input, self.spec);
+        // For internal contract calls, we rely on outer gas accounting. Here we only
+        // validate that builtin itself is well-defined; gas exhaustion will be
+        // handled at higher layers if needed.
+        let mut out_buf = Vec::new();
+        let mut out_ref = BytesRef::Flexible(&mut out_buf);
+        builtin
+            .execute(input, &mut out_ref)
+            .map_err(|e| vm::Error::BuiltIn(e.0))?;
+        Ok(out_buf)
     }
 }

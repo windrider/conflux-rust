@@ -635,9 +635,10 @@ impl<'a> Context<'a> {
             callstack: self.callstack,
             state: self.state,
             substate: &mut self.substate,
+            tracer: self.tracer,
             static_flag: self.static_flag,
             depth: self.depth,
-            tracer: self.tracer,
+            machine: self.machine,
         }
     }
 

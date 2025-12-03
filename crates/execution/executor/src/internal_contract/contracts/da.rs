@@ -25,7 +25,9 @@ fn generate_fn_table() -> SolFnTable {
         RegisteredEpoch,
         RegisterNextEpoch,
         RegisterSigner,
-        UpdateSocket
+        UpdateSocket,
+        FinalizeEpoch,
+        SetEpochBlocks
     )
 }
 
@@ -41,7 +43,9 @@ group_impl_is_active!(
     RegisteredEpoch,
     RegisterNextEpoch,
     RegisterSigner,
-    UpdateSocket
+    UpdateSocket,
+    FinalizeEpoch,
+    SetEpochBlocks
 );
 
 // Events
@@ -262,6 +266,56 @@ impl SimpleExecutionTrait for RegisteredEpoch {
 }
 
 // State-Changing Functions
+make_solidity_function! {
+    /// function finalizeEpoch() external;
+    pub struct FinalizeEpoch((), "finalizeEpoch()");
+}
+
+impl_function_type!(FinalizeEpoch, "non_payable_write");
+
+impl UpfrontPaymentTrait for FinalizeEpoch {
+    fn upfront_gas_payment(
+        &self, _input: &(), _params: &ActionParams,
+        _context: &InternalRefContext,
+    ) -> DbResult<U256> {
+        Ok(U256::zero())
+    }
+}
+
+impl SimpleExecutionTrait for FinalizeEpoch {
+    fn execute_inner(
+        &self, _input: (), _params: &ActionParams,
+        context: &mut InternalRefContext,
+    ) -> vm::Result<()> {
+        finalize_epoch(context)
+    }
+}
+
+make_solidity_function! {
+    /// function setEpochBlocks(uint _epochBlocks) external;
+    pub struct SetEpochBlocks(U256, "setEpochBlocks(uint256)");
+}
+
+impl_function_type!(SetEpochBlocks, "non_payable_write");
+
+impl UpfrontPaymentTrait for SetEpochBlocks {
+    fn upfront_gas_payment(
+        &self, _input: &U256, _params: &ActionParams,
+        _context: &InternalRefContext,
+    ) -> DbResult<U256> {
+        Ok(U256::zero())
+    }
+}
+
+impl SimpleExecutionTrait for SetEpochBlocks {
+    fn execute_inner(
+        &self, input: U256, _params: &ActionParams,
+        context: &mut InternalRefContext,
+    ) -> vm::Result<()> {
+        set_epoch_blocks(input, context)
+    }
+}
+
 make_solidity_function! {
     /// function registerNextEpoch(BN254.G1Point memory _signature) external;
     pub struct RegisterNextEpoch(G1Point, "registerNextEpoch((uint256,uint256))");

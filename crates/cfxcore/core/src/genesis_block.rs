@@ -160,11 +160,58 @@ pub fn genesis_block(
     state
         .add_balance(&genesis_account_address, &genesis_account_init_balance)
         .unwrap();
+
+    let genesis_chain_id = genesis_chain_id.unwrap_or(0);
+    
+    eprintln!("[GENESIS] genesis_chain_id after unwrap: {}", genesis_chain_id);
+    
+    // Initialize DA contract storage if cipda is enabled from genesis  
+    if genesis_chain_id == 10 { // chain_id 10 is our DA chain
+        use cfx_parameters::internal_contract_addresses::DA_CONTRACT_ADDRESS;
+        use keccak_hash::keccak;
+        
+        eprintln!("[DA INIT] ===== Starting DA contract initialization =====");
+        eprintln!("[DA INIT] chain_id: {}", genesis_chain_id);
+        eprintln!("[DA INIT] DA_CONTRACT_ADDRESS: {:?}", DA_CONTRACT_ADDRESS);
+        
+        // Calculate DA contract's base slot (same as da.rs: da_contract_base_slot())
+        // Slot 0 stores currentEpoch
+        let hash = keccak(Address::from(DA_CONTRACT_ADDRESS).as_bytes());
+        let base_slot = U256::from_big_endian(hash.as_ref());
+        
+        eprintln!("[DA INIT] Calculated base_slot: {:?}", base_slot);
+        eprintln!("[DA INIT] base_slot as hex: 0x{:x}", base_slot);
+        
+        // Convert to byte array for set_system_storage
+        let mut slot_key = [0u8; 32];
+        base_slot.to_big_endian(&mut slot_key);
+        
+        eprintln!("[DA INIT] slot_key bytes: {:?}", &slot_key[..8]);
+        eprintln!("[DA INIT] Calling set_system_storage...");
+        
+        // Initialize epoch_number to 0 at base_slot
+        // This ensures the DA contract's epochNumber() function returns proper value
+        match state.set_system_storage(slot_key.to_vec(), U256::zero()) {
+            Ok(_) => {
+                eprintln!("[DA INIT] ✓ set_system_storage succeeded");
+            }
+            Err(e) => {
+                eprintln!("[DA INIT] ✗ set_system_storage failed: {:?}", e);
+                panic!("Failed to initialize DA epoch_number: {:?}", e);
+            }
+        }
+        
+        eprintln!("[DA INIT] ===== DA initialization complete =====");
+        info!("Initialized DA contract epoch_number to 0 at genesis");
+    } else {
+        eprintln!("[DA INIT] ✗ Skipping DA initialization, chain_id is {}, expected 10", genesis_chain_id);
+    }
+    
+    // Commit all changes including DA initialization
     state.commit_cache(false);
 
     let mut debug_record = Some(ComputeEpochDebugRecord::default());
-
-    let genesis_chain_id = genesis_chain_id.unwrap_or(0);
+    
     let mut genesis_transaction = NativeTransaction::default();
     genesis_transaction.data = GENESIS_TRANSACTION_DATA_STR.as_bytes().into();
     genesis_transaction.action = Action::Call(Default::default());

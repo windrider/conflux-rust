@@ -1,0 +1,1 @@
+CMAKE_POLICY_VERSION_MINIMUM="3.5" CFLAGS="-Wno-error=array-bounds -Wno-array-bounds" CXXFLAGS="-Wno-error=array-bounds -Wno-array-bounds" cargo build --release

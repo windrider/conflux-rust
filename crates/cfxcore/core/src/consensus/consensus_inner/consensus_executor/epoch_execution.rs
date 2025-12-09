@@ -255,7 +255,7 @@ impl ConsensusExecutionHandler {
                 use cfx_executor::executive_observer::TracerTrait;
                 
                 let mut dummy_substate = Substate::new();
-                let mut dummy_callstack = CallStackInfo::default();
+                let mut dummy_callstack = CallStackInfo::new();
                 let mut dummy_tracer = ();
                 
                 let mut internal_ref_ctx = InternalRefContext {
@@ -270,9 +270,13 @@ impl ConsensusExecutionHandler {
                     machine,
                 };
                 
-                if let Err(e) = cfx_executor::internal_contract::impls::da::finalize_epoch(&mut internal_ref_ctx) {
+                if let Err(e) = cfx_executor::internal_contract::call_da_finalize_epoch(&mut internal_ref_ctx) {
                     warn!("Failed to call DA finalize_epoch at block {}: {:?}", block_number, e);
                 }
+                
+                // Clear state cache after finalize_epoch to prevent assertion failure
+                // in the first transaction's ExecutiveContext::transact()
+                state.update_state_post_tx_execution(false);
             }
         }
 

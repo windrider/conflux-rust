@@ -1,5 +1,5 @@
 use crate::{
-    builtin::Builtin,
+    //builtin::Builtin,
     executive_observer::TracerTrait,
     machine::Machine,
     stack::CallStackInfo,
@@ -83,12 +83,13 @@ impl<'a> InternalRefContext<'a> {
     /// Call a builtin precompile directly from an internal contract.
     /// This uses the same builtin lookup and execution logic as normal EVM calls,
     /// but bypasses bytecode and directly invokes the native implementation.
+    /// Internal contracts always run in Native Space.
     pub fn call_builtin(
         &mut self, address: &Address, input: &[u8],
     ) -> vm::Result<Vec<u8>> {
         use cfx_bytes::BytesRef;
 
-        let addr_with_space = address.with_space(self.env.space);
+        let addr_with_space = address.with_native_space();
         let block_number = self.env.number;
 
         let builtin = self
@@ -98,7 +99,7 @@ impl<'a> InternalRefContext<'a> {
                 vm::Error::InternalContract("Builtin not found at address".into())
             })?;
 
-        let cost = builtin.cost(input, self.spec);
+        let _cost = builtin.cost(input, self.spec);
         // For internal contract calls, we rely on outer gas accounting. Here we only
         // validate that builtin itself is well-defined; gas exhaustion will be
         // handled at higher layers if needed.

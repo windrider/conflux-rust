@@ -5,7 +5,7 @@
 mod admin;
 mod context;
 pub(super) mod cross_space;
-mod da;
+pub(super) mod da;
 mod future;
 pub(super) mod params_control;
 pub(super) mod pos;

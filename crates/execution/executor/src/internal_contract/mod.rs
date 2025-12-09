@@ -33,3 +33,10 @@ pub use self::{
         },
     },
 };
+
+/// Public wrapper for DA finalize_epoch function
+pub fn call_da_finalize_epoch(
+    context: &mut InternalRefContext,
+) -> cfx_vm_types::Result<()> {
+    impls::da::finalize_epoch(context)
+}

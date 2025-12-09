@@ -309,10 +309,10 @@ impl UpfrontPaymentTrait for SetEpochBlocks {
 
 impl SimpleExecutionTrait for SetEpochBlocks {
     fn execute_inner(
-        &self, input: U256, _params: &ActionParams,
+        &self, input: U256, params: &ActionParams,
         context: &mut InternalRefContext,
     ) -> vm::Result<()> {
-        set_epoch_blocks(input, context)
+        set_epoch_blocks(input, params, context)
     }
 }
 

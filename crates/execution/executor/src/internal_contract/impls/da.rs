@@ -4,6 +4,9 @@ use cfx_vm_types::ActionParams;
 use solidity_abi_derive::ABIVariable;
 use keccak_hash::keccak;
 
+// Import BN254 elliptic curve types for point operations
+use crate::bn::{AffineG1, Fq, Group, G1};
+
 use crate::internal_contract::InternalRefContext;
 use crate::internal_contract::components::SolidityEventTrait;
 use cfx_vm_types as vm;
@@ -166,11 +169,121 @@ pub fn epoch_number(context: &mut InternalRefContext) -> vm::Result<U256> {
 }
 
 pub fn get_agg_pk_g1(
-    _input: (U256, U256, Bytes), _context: &mut InternalRefContext,
+    input: (U256, U256, Bytes), context: &mut InternalRefContext,
 ) -> vm::Result<(G1Point, U256, U256)> {
-    // TODO: Implement aggregated public key calculation
-    // For now, return zero values as placeholder
-    Ok((G1Point(U256::zero(), U256::zero()), U256::zero(), U256::zero()))
+    let (epoch, quorum_id, quorum_bitmap) = input;
+    
+    eprintln!("[GET_AGG_PK_G1] epoch={}, quorum_id={}, bitmap_len={}", epoch, quorum_id, quorum_bitmap.len());
+    
+    // Get the quorum (list of signer addresses)
+    let quorum_signers = get_quorum((epoch, quorum_id), context)?;
+    let total = quorum_signers.len() as u64;
+    
+    if total == 0 {
+        eprintln!("[GET_AGG_PK_G1] No signers in quorum");
+        return Ok((G1Point(U256::zero(), U256::zero()), U256::zero(), U256::zero()));
+    }
+    
+    // Parse bitmap to find which signers participated
+    // quorumBitmap is a bytes array where each bit represents a signer
+    // Use a HashSet to track which signers have been added (for deduplication)
+    use std::collections::HashSet;
+    let mut hit_count: u64 = 0;
+    let mut agg_point: Option<G1> = None;
+    let mut added_signers: HashSet<Address> = HashSet::new();
+    
+    for (i, signer_addr) in quorum_signers.iter().enumerate() {
+        // Check if this signer's bit is set in the bitmap
+        let byte_index = i / 8;
+        let bit_index = i % 8;
+        
+        if byte_index >= quorum_bitmap.len() {
+            break; // Bitmap is shorter than expected
+        }
+        
+        let is_set = (quorum_bitmap[byte_index] & (1 << bit_index)) != 0;
+        
+        if !is_set {
+            continue;
+        }
+        
+        // Always increment hit_count for each set bit
+        hit_count += 1;
+        
+        // Check if we've already added this signer's public key (deduplication)
+        if added_signers.contains(signer_addr) {
+            eprintln!("[GET_AGG_PK_G1] signer[{}]={:?} already added, skipping pk aggregation", i, signer_addr);
+            continue; // Skip aggregation, but hit_count was already incremented
+        }
+        
+        // Mark this signer as added
+        added_signers.insert(*signer_addr);
+        
+        // Read this signer's G1 public key
+        let g1_x_key = signer_pk_g1_x_slot(signer_addr);
+        let g1_y_key = signer_pk_g1_y_slot(signer_addr);
+        
+        let g1_x_u256 = context
+            .state
+            .get_system_storage(&g1_x_key)
+            .map_err(|_| vm::Error::InternalContract("Failed to read G1 x".to_string()))?;
+        let g1_y_u256 = context
+            .state
+            .get_system_storage(&g1_y_key)
+            .map_err(|_| vm::Error::InternalContract("Failed to read G1 y".to_string()))?;
+        
+        eprintln!("[GET_AGG_PK_G1] signer[{}]={:?}, pkG1=({}, {}) - ADDING to aggregate", i, signer_addr, g1_x_u256, g1_y_u256);
+        
+        // Convert U256 to Fq (BN254 base field element)
+        let mut x_bytes = [0u8; 32];
+        let mut y_bytes = [0u8; 32];
+        g1_x_u256.to_big_endian(&mut x_bytes);
+        g1_y_u256.to_big_endian(&mut y_bytes);
+        
+        let px = Fq::from_slice(&x_bytes)
+            .map_err(|_| vm::Error::InternalContract("Invalid G1 x coordinate".to_string()))?;
+        let py = Fq::from_slice(&y_bytes)
+            .map_err(|_| vm::Error::InternalContract("Invalid G1 y coordinate".to_string()))?;
+        
+        // Create G1 point (handle zero point case)
+        let point = if px == Fq::zero() && py == Fq::zero() {
+            G1::zero()
+        } else {
+            G1::from(
+                AffineG1::new(px, py)
+                    .map_err(|_| vm::Error::InternalContract("Invalid G1 point".to_string()))?
+            )
+        };
+        
+        // Aggregate using elliptic curve point addition (only for first occurrence)
+        agg_point = Some(match agg_point {
+            None => point,
+            Some(acc) => acc + point,
+        });
+    }
+    
+    // Convert aggregated point back to U256 coordinates
+    let (agg_x, agg_y) = match agg_point {
+        None => (U256::zero(), U256::zero()),
+        Some(p) => {
+            if let Some(affine) = AffineG1::from_jacobian(p) {
+                let mut x_bytes = [0u8; 32];
+                let mut y_bytes = [0u8; 32];
+                affine.x().to_big_endian(&mut x_bytes)
+                    .map_err(|_| vm::Error::InternalContract("Failed to serialize G1 x".to_string()))?;
+                affine.y().to_big_endian(&mut y_bytes)
+                    .map_err(|_| vm::Error::InternalContract("Failed to serialize G1 y".to_string()))?;
+                (U256::from_big_endian(&x_bytes), U256::from_big_endian(&y_bytes))
+            } else {
+                // Point at infinity
+                (U256::zero(), U256::zero())
+            }
+        }
+    };
+    
+    eprintln!("[GET_AGG_PK_G1] total={}, hit={}, agg_pk=({}, {})", total, hit_count, agg_x, agg_y);
+    
+    Ok((G1Point(agg_x, agg_y), U256::from(total), U256::from(hit_count)))
 }
 
 /// Get all signer addresses in a specific epoch's quorum
@@ -216,10 +329,10 @@ pub fn get_quorum(
             .map_err(|_| vm::Error::InternalContract("Failed to read quorum signer".to_string()))?;
         
         // Convert U256 to Address (take the lower 20 bytes)
-        let mut addr_bytes = [0u8; 20];
-        addr_u256.to_big_endian(&mut addr_bytes[..]);
-        let addr_bytes_slice = &addr_bytes[addr_bytes.len() - 20..];
-        signers.push(Address::from_slice(addr_bytes_slice));
+        let mut addr_bytes = [0u8; 32];  // U256 needs 32 bytes buffer
+        addr_u256.to_big_endian(&mut addr_bytes);
+        let signer = Address::from_slice(&addr_bytes[12..32]);
+        signers.push(signer);
     }
     
     Ok(signers)
@@ -258,10 +371,9 @@ pub fn get_quorum_row(
         .map_err(|_| vm::Error::InternalContract("Failed to read signer address".to_string()))?;
     
     // Convert U256 to Address
-    let mut addr_bytes = [0u8; 20];
-    addr_u256.to_big_endian(&mut addr_bytes[..]);
-    let addr_bytes_slice = &addr_bytes[addr_bytes.len() - 20..];
-    Ok(Address::from_slice(addr_bytes_slice))
+    let mut addr_bytes = [0u8; 32];  // U256 needs 32 bytes buffer
+    addr_u256.to_big_endian(&mut addr_bytes);
+    Ok(Address::from_slice(&addr_bytes[12..32]))
 }
 
 /// Get detailed information for multiple signers
@@ -285,15 +397,47 @@ pub fn get_signer(
             continue;
         }
         
-        // Read socket hash and convert to string (simplified: return hex of hash)
-        let socket_key = signer_socket_slot(&addr);
-        let socket_hash = context
-            .state
-            .get_system_storage(&socket_key)
-            .map_err(|_| vm::Error::InternalContract("Failed to read socket".to_string()))?;
+        // Read socket string from storage (3 slots: data0, data1, length)
+        let socket_slot_base = signer_socket_slot(&addr);
         
-        // Convert socket hash to hex string
-        let socket_str = format!("0x{:x}", socket_hash);
+        // Read length first
+        let socket_len_slot = u256_to_array(U256::from_big_endian(&socket_slot_base) + U256::from(2));
+        let socket_len = context
+            .state
+            .get_system_storage(&socket_len_slot)
+            .map_err(|_| vm::Error::InternalContract("Failed to read socket length".to_string()))?
+            .as_usize();
+        
+        let socket_str = if socket_len == 0 || socket_len > 64 {
+            String::new()
+        } else {
+            let mut socket_bytes = Vec::new();
+            
+            // Read first 32 bytes
+            let socket_data_0 = context
+                .state
+                .get_system_storage(&socket_slot_base)
+                .map_err(|_| vm::Error::InternalContract("Failed to read socket slot 0".to_string()))?;
+            let mut chunk0 = [0u8; 32];
+            socket_data_0.to_big_endian(&mut chunk0);
+            let first_len = socket_len.min(32);
+            socket_bytes.extend_from_slice(&chunk0[..first_len]);
+            
+            // Read second 32 bytes if needed
+            if socket_len > 32 {
+                let socket_slot_1 = u256_to_array(U256::from_big_endian(&socket_slot_base) + U256::one());
+                let socket_data_1 = context
+                    .state
+                    .get_system_storage(&socket_slot_1)
+                    .map_err(|_| vm::Error::InternalContract("Failed to read socket slot 1".to_string()))?;
+                let mut chunk1 = [0u8; 32];
+                socket_data_1.to_big_endian(&mut chunk1);
+                let second_len = socket_len - 32;
+                socket_bytes.extend_from_slice(&chunk1[..second_len]);
+            }
+            
+            String::from_utf8_lossy(&socket_bytes).to_string()
+        };
         
         // Read G1 public key (2 coordinates)
         let g1_x_key = signer_pk_g1_x_slot(&addr);
@@ -461,19 +605,22 @@ pub fn finalize_epoch(context: &mut InternalRefContext) -> vm::Result<()> {
         let epoch_slot = mapping_slot(base, expected_epoch);
         let quorum_slot = mapping_slot(epoch_slot, U256::zero()); // quorum_id = 0
         
-        // Write array length
+        // Write array length (always 1024 to match encoder slices)
+        const NUM_SLICES: usize = 1024;
         let length_key = u256_to_array(quorum_slot);
-        let length = U256::from(registered_signers.len());
+        let length = U256::from(NUM_SLICES);
         context
             .state
             .set_system_storage(length_key.to_vec(), length)
             .map_err(|_| vm::Error::InternalContract("Failed to set quorum length".into()))?;
         
-        // Write array elements
+        // Write array elements with round-robin distribution
+        // If we have fewer signers than NUM_SLICES, repeat them in round-robin fashion
         let array_data_slot = dynamic_slot(quorum_slot);
-        for (i, signer) in registered_signers.iter().enumerate() {
+        for i in 0..NUM_SLICES {
+            let signer_idx = i % registered_signers.len();
             let element_slot = u256_to_array(array_data_slot + U256::from(i));
-            let signer_u256 = U256::from_big_endian(signer.as_bytes());
+            let signer_u256 = U256::from_big_endian(registered_signers[signer_idx].as_bytes());
             context
                 .state
                 .set_system_storage(element_slot.to_vec(), signer_u256)
@@ -628,14 +775,54 @@ pub fn register_signer(
         pk_g2.1[1],
     ).map_err(|_| vm::Error::InternalContract("Failed to store signer pk_g2.y1".to_string()))?;
 
-    // Step 5: Store socket address as keccak hash
-    // For simplicity, we store the keccak256 hash of the socket string
-    let socket_hash = keccak(socket.as_bytes());
-    let socket_slot_key = signer_socket_slot(&signer_addr);
+    // Step 5: Store socket address as string (max 64 bytes, using 2 slots)
+    // Slot 0: first 32 bytes
+    // Slot 1: remaining bytes (up to 32 bytes)
+    // Simple encoding: no special markers, just raw bytes
+    let socket_bytes = socket.as_bytes();
+    let socket_len = socket_bytes.len();
+    
+    if socket_len > 64 {
+        return Err(vm::Error::InternalContract(
+            "Socket address too long (max 64 bytes)".to_string(),
+        ));
+    }
+    
+    let socket_slot_base = signer_socket_slot(&signer_addr);
+    
+    // Store first 32 bytes in slot 0
+    let mut first_chunk = [0u8; 32];
+    let first_len = socket_len.min(32);
+    first_chunk[..first_len].copy_from_slice(&socket_bytes[..first_len]);
     context.state.set_system_storage(
-        socket_slot_key.to_vec(),
-        U256::from_big_endian(socket_hash.as_ref()),
-    ).map_err(|_| vm::Error::InternalContract("Failed to store socket".to_string()))?;
+        socket_slot_base.to_vec(),
+        U256::from_big_endian(&first_chunk),
+    ).map_err(|_| vm::Error::InternalContract("Failed to store socket slot 0".to_string()))?;
+    
+    // Store remaining bytes in slot 1 (if any)
+    let socket_slot_1 = u256_to_array(U256::from_big_endian(&socket_slot_base) + U256::one());
+    if socket_len > 32 {
+        let mut second_chunk = [0u8; 32];
+        let remaining = &socket_bytes[32..];
+        second_chunk[..remaining.len()].copy_from_slice(remaining);
+        context.state.set_system_storage(
+            socket_slot_1.to_vec(),
+            U256::from_big_endian(&second_chunk),
+        ).map_err(|_| vm::Error::InternalContract("Failed to store socket slot 1".to_string()))?;
+    } else {
+        // Clear slot 1 if not needed
+        context.state.set_system_storage(
+            socket_slot_1.to_vec(),
+            U256::zero(),
+        ).map_err(|_| vm::Error::InternalContract("Failed to clear socket slot 1".to_string()))?;
+    }
+    
+    // Store length in a separate slot for easier reading
+    let socket_len_slot = u256_to_array(U256::from_big_endian(&socket_slot_base) + U256::from(2));
+    context.state.set_system_storage(
+        socket_len_slot.to_vec(),
+        U256::from(socket_len),
+    ).map_err(|_| vm::Error::InternalContract("Failed to store socket length".to_string()))?;
 
     // Step 6: Mark signer as active/registered
     let is_signer_key = is_signer_slot(&signer_addr);
@@ -707,16 +894,50 @@ pub fn update_socket(
         ));
     }
 
-    // Step 2: Update socket hash in storage
-    let socket_hash = keccak(input.as_bytes());
-    let socket_slot_key = signer_socket_slot(&params.sender);
-    context
-        .state
-        .set_system_storage(
-            socket_slot_key.to_vec(),
-            U256::from_big_endian(socket_hash.as_ref()),
-        )
-        .map_err(|_| vm::Error::InternalContract("Failed to update socket".to_string()))?;
+    // Step 2: Update socket string in storage (max 64 bytes, 3 slots total)
+    let socket_bytes = input.as_bytes();
+    let socket_len = socket_bytes.len();
+    
+    if socket_len > 64 {
+        return Err(vm::Error::InternalContract(
+            "Socket address too long (max 64 bytes)".to_string(),
+        ));
+    }
+    
+    let socket_slot_base = signer_socket_slot(&params.sender);
+    
+    // Store first 32 bytes
+    let mut first_chunk = [0u8; 32];
+    let first_len = socket_len.min(32);
+    first_chunk[..first_len].copy_from_slice(&socket_bytes[..first_len]);
+    context.state.set_system_storage(
+        socket_slot_base.to_vec(),
+        U256::from_big_endian(&first_chunk),
+    ).map_err(|_| vm::Error::InternalContract("Failed to update socket slot 0".to_string()))?;
+    
+    // Store remaining bytes or clear
+    let socket_slot_1 = u256_to_array(U256::from_big_endian(&socket_slot_base) + U256::one());
+    if socket_len > 32 {
+        let mut second_chunk = [0u8; 32];
+        let remaining = &socket_bytes[32..];
+        second_chunk[..remaining.len()].copy_from_slice(remaining);
+        context.state.set_system_storage(
+            socket_slot_1.to_vec(),
+            U256::from_big_endian(&second_chunk),
+        ).map_err(|_| vm::Error::InternalContract("Failed to update socket slot 1".to_string()))?;
+    } else {
+        context.state.set_system_storage(
+            socket_slot_1.to_vec(),
+            U256::zero(),
+        ).map_err(|_| vm::Error::InternalContract("Failed to clear socket slot 1".to_string()))?;
+    }
+    
+    // Store length
+    let socket_len_slot = u256_to_array(U256::from_big_endian(&socket_slot_base) + U256::from(2));
+    context.state.set_system_storage(
+        socket_len_slot.to_vec(),
+        U256::from(socket_len),
+    ).map_err(|_| vm::Error::InternalContract("Failed to update socket length".to_string()))?;
 
     // Step 3: Emit SocketUpdated event
     SocketUpdatedEvent::log(&params.sender, &input, params, context)?;

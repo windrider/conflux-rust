@@ -5,7 +5,7 @@ use solidity_abi_derive::ABIVariable;
 use keccak_hash::keccak;
 
 // Import BN254 elliptic curve types for point operations
-use crate::bn::{AffineG1, Fq, Group, G1};
+use crate::bn::{pairing, AffineG1, AffineG2, Fq, Fq2, Fr, Group, Gt, G1, G2};
 
 use crate::internal_contract::InternalRefContext;
 use crate::internal_contract::components::SolidityEventTrait;
@@ -140,6 +140,205 @@ fn signer_pk_g2_y1_slot(signer: &Address) -> [u8; 32] {
 /// Get the storage slot for the allSigners array (slot 7)
 fn all_signers_slot() -> U256 {
     da_contract_base_slot() + U256::from(7)
+}
+
+// ============================================================================
+// BN254 Signature Verification Helper Functions (following 0g implementation)
+// ============================================================================
+
+/// Convert U256 pair to G1 point
+fn u256_pair_to_g1(x: &U256, y: &U256) -> Result<G1, String> {
+    let mut x_bytes = [0u8; 32];
+    let mut y_bytes = [0u8; 32];
+    x.to_big_endian(&mut x_bytes);
+    y.to_big_endian(&mut y_bytes);
+    
+    let px = Fq::from_slice(&x_bytes)
+        .map_err(|_| "Invalid x coordinate")?;
+    let py = Fq::from_slice(&y_bytes)
+        .map_err(|_| "Invalid y coordinate")?;
+    
+    if px == Fq::zero() && py == Fq::zero() {
+        Ok(G1::zero())
+    } else {
+        Ok(G1::from(
+            AffineG1::new(px, py)
+                .map_err(|_| "Invalid G1 point")?  
+        ))
+    }
+}
+
+/// Convert U256 quad to G2 point
+fn u256_quad_to_g2(x0: &U256, x1: &U256, y0: &U256, y1: &U256) -> Result<G2, String> {
+    let mut x0_bytes = [0u8; 32];
+    let mut x1_bytes = [0u8; 32];
+    let mut y0_bytes = [0u8; 32];
+    let mut y1_bytes = [0u8; 32];
+    x0.to_big_endian(&mut x0_bytes);
+    x1.to_big_endian(&mut x1_bytes);
+    y0.to_big_endian(&mut y0_bytes);
+    y1.to_big_endian(&mut y1_bytes);
+    
+    let px0 = Fq::from_slice(&x0_bytes)
+        .map_err(|_| "Invalid x0 coordinate")?;
+    let px1 = Fq::from_slice(&x1_bytes)
+        .map_err(|_| "Invalid x1 coordinate")?;
+    let py0 = Fq::from_slice(&y0_bytes)
+        .map_err(|_| "Invalid y0 coordinate")?;
+    let py1 = Fq::from_slice(&y1_bytes)
+        .map_err(|_| "Invalid y1 coordinate")?;
+    
+    let p_a = Fq2::new(px0, px1);
+    let p_b = Fq2::new(py0, py1);
+    
+    if p_a.is_zero() && p_b.is_zero() {
+        Ok(G2::zero())
+    } else {
+        Ok(G2::from(
+            AffineG2::new(p_a, p_b)
+                .map_err(|_| "Invalid G2 point")?  
+        ))
+    }
+}
+
+/// Map hash to G1 curve point using try-and-increment method
+/// Following 0g's MapToCurve implementation
+fn map_to_curve(digest: [u8; 32]) -> Result<G1, String> {
+    use num::{BigUint, One, Zero as NumZero};
+    
+    // BN254 curve equation: y^2 = x^3 + 3
+    let one = BigUint::one();
+    let three = BigUint::from(3u32);
+    
+    // Get field modulus
+    let modulus = BigUint::parse_bytes(b"21888242871839275222246405745257275088696311157297823662689037894645226208583", 10)
+        .ok_or("Failed to parse modulus")?;
+    
+    let mut x = BigUint::from_bytes_be(&digest);
+    x = x % &modulus;
+    
+    // Try-and-increment: keep incrementing x until we find a valid point
+    for _ in 0..100 {
+        // Compute y^2 = x^3 + 3
+        let x_cubed = x.modpow(&BigUint::from(3u32), &modulus);
+        let y_squared = (&x_cubed + &three) % &modulus;
+        
+        // Try to compute square root
+        // For BN254 field, p ≡ 3 (mod 4), so sqrt(a) = a^((p+1)/4) mod p
+        let exp = (&modulus + &one) / BigUint::from(4u32);
+        let y = y_squared.modpow(&exp, &modulus);
+        
+        // Verify y^2 == y_squared
+        if (&y * &y) % &modulus == y_squared {
+            // Found valid point, convert to Fq
+            let mut x_bytes = [0u8; 32];
+            let mut y_bytes = [0u8; 32];
+            
+            let x_vec = x.to_bytes_be();
+            let y_vec = y.to_bytes_be();
+            
+            // Pad with zeros if needed
+            if x_vec.len() <= 32 {
+                x_bytes[32 - x_vec.len()..].copy_from_slice(&x_vec);
+            } else {
+                return Err("X coordinate too large".to_string());
+            }
+            
+            if y_vec.len() <= 32 {
+                y_bytes[32 - y_vec.len()..].copy_from_slice(&y_vec);
+            } else {
+                return Err("Y coordinate too large".to_string());
+            }
+            
+            let px = Fq::from_slice(&x_bytes)
+                .map_err(|_| "Failed to convert x to Fq")?;
+            let py = Fq::from_slice(&y_bytes)
+                .map_err(|_| "Failed to convert y to Fq")?;
+            
+            let point = AffineG1::new(px, py)
+                .map_err(|_| "Invalid point on curve")?;
+            
+            return Ok(G1::from(point));
+        }
+        
+        // Increment x and try again
+        x = (&x + &one) % &modulus;
+    }
+    
+    Err("Failed to find valid curve point after 100 iterations".to_string())
+}
+
+/// Compute gamma for signature verification
+/// gamma = keccak256(hash || signature || pkG1 || pkG2) mod r
+/// Following 0g's Gamma function
+fn compute_gamma(hash: &G1, signature: &G1, pk_g1: &G1, pk_g2: &G2) -> Fr {
+    let mut to_hash = Vec::new();
+    
+    // Serialize hash (G1)
+    if let Some(h_affine) = AffineG1::from_jacobian(*hash) {
+        let mut x_bytes = [0u8; 32];
+        let mut y_bytes = [0u8; 32];
+        let _ = h_affine.x().to_big_endian(&mut x_bytes);
+        let _ = h_affine.y().to_big_endian(&mut y_bytes);
+        to_hash.extend_from_slice(&x_bytes);
+        to_hash.extend_from_slice(&y_bytes);
+    } else {
+        // Point at infinity
+        to_hash.extend_from_slice(&[0u8; 64]);
+    }
+    
+    // Serialize signature (G1)
+    if let Some(sig_affine) = AffineG1::from_jacobian(*signature) {
+        let mut x_bytes = [0u8; 32];
+        let mut y_bytes = [0u8; 32];
+        let _ = sig_affine.x().to_big_endian(&mut x_bytes);
+        let _ = sig_affine.y().to_big_endian(&mut y_bytes);
+        to_hash.extend_from_slice(&x_bytes);
+        to_hash.extend_from_slice(&y_bytes);
+    } else {
+        to_hash.extend_from_slice(&[0u8; 64]);
+    }
+    
+    // Serialize pkG1 (G1)
+    if let Some(pk1_affine) = AffineG1::from_jacobian(*pk_g1) {
+        let mut x_bytes = [0u8; 32];
+        let mut y_bytes = [0u8; 32];
+        let _ = pk1_affine.x().to_big_endian(&mut x_bytes);
+        let _ = pk1_affine.y().to_big_endian(&mut y_bytes);
+        to_hash.extend_from_slice(&x_bytes);
+        to_hash.extend_from_slice(&y_bytes);
+    } else {
+        to_hash.extend_from_slice(&[0u8; 64]);
+    }
+    
+    // Serialize pkG2 (G2)
+    if let Some(pk2_affine) = AffineG2::from_jacobian(*pk_g2) {
+        let mut x0_bytes = [0u8; 32];
+        let mut x1_bytes = [0u8; 32];
+        let mut y0_bytes = [0u8; 32];
+        let mut y1_bytes = [0u8; 32];
+        let _ = pk2_affine.x().real().to_big_endian(&mut x0_bytes);
+        let _ = pk2_affine.x().imaginary().to_big_endian(&mut x1_bytes);
+        let _ = pk2_affine.y().real().to_big_endian(&mut y0_bytes);
+        let _ = pk2_affine.y().imaginary().to_big_endian(&mut y1_bytes);
+        to_hash.extend_from_slice(&x0_bytes);
+        to_hash.extend_from_slice(&x1_bytes);
+        to_hash.extend_from_slice(&y0_bytes);
+        to_hash.extend_from_slice(&y1_bytes);
+    } else {
+        to_hash.extend_from_slice(&[0u8; 128]);
+    }
+    
+    // Compute keccak256
+    let gamma_hash = keccak(&to_hash);
+    
+    // Convert to Fr (scalar field element) by taking mod r
+    let mut gamma_bytes = [0u8; 32];
+    gamma_bytes.copy_from_slice(gamma_hash.as_bytes());
+    
+    // Convert to Fr
+    Fr::from_slice(&gamma_bytes)
+        .unwrap_or_else(|_| Fr::zero())
 }
 
 // ============================================================================
@@ -681,8 +880,82 @@ pub fn register_next_epoch(
     let next_epoch = current_epoch + U256::one();
 
     // Step 4: BN254 signature verification for epoch registration
-    // TODO: Implement signature verification similar to register_signer
-    // This would verify: e(signature, G2) = e(hash(sender || nextEpoch), pkG2)
+    // Following 0g implementation: EpochRegistrationHash(sender, nextEpoch, chainId)
+    
+    // Read signer's public keys from storage
+    let g1_x_key = signer_pk_g1_x_slot(&params.sender);
+    let g1_y_key = signer_pk_g1_y_slot(&params.sender);
+    let g2_x0_key = signer_pk_g2_x0_slot(&params.sender);
+    let g2_x1_key = signer_pk_g2_x1_slot(&params.sender);
+    let g2_y0_key = signer_pk_g2_y0_slot(&params.sender);
+    let g2_y1_key = signer_pk_g2_y1_slot(&params.sender);
+    
+    let g1_x = context.state.get_system_storage(&g1_x_key)
+        .map_err(|_| vm::Error::InternalContract("Failed to read G1 x".to_string()))?;
+    let g1_y = context.state.get_system_storage(&g1_y_key)
+        .map_err(|_| vm::Error::InternalContract("Failed to read G1 y".to_string()))?;
+    let g2_x0 = context.state.get_system_storage(&g2_x0_key)
+        .map_err(|_| vm::Error::InternalContract("Failed to read G2 x0".to_string()))?;
+    let g2_x1 = context.state.get_system_storage(&g2_x1_key)
+        .map_err(|_| vm::Error::InternalContract("Failed to read G2 x1".to_string()))?;
+    let g2_y0 = context.state.get_system_storage(&g2_y0_key)
+        .map_err(|_| vm::Error::InternalContract("Failed to read G2 y0".to_string()))?;
+    let g2_y1 = context.state.get_system_storage(&g2_y1_key)
+        .map_err(|_| vm::Error::InternalContract("Failed to read G2 y1".to_string()))?;
+    
+    // Convert signature (G1Point) to G1
+    let signature_point = u256_pair_to_g1(&input.0, &input.1)
+        .map_err(|e| vm::Error::InternalContract(format!("Invalid signature: {}", e)))?;
+    
+    // Convert public keys to curve points
+    let pk_g1 = u256_pair_to_g1(&g1_x, &g1_y)
+        .map_err(|e| vm::Error::InternalContract(format!("Invalid pkG1: {}", e)))?;
+    let pk_g2 = u256_quad_to_g2(&g2_x0, &g2_x1, &g2_y0, &g2_y1)
+        .map_err(|e| vm::Error::InternalContract(format!("Invalid pkG2: {}", e)))?;
+    
+    // Compute message hash: keccak256(sender || epoch || chainId)
+    // Get chainId from environment (Conflux dev chain uses 10)
+    let chain_id = U256::from(context.env.chain_id[&cfx_types::Space::Ethereum] as u64);
+    
+    let mut to_hash = Vec::new();
+    to_hash.extend_from_slice(params.sender.as_bytes());
+    let mut epoch_bytes = [0u8; 8];
+    epoch_bytes.copy_from_slice(&next_epoch.low_u64().to_be_bytes());
+    to_hash.extend_from_slice(&epoch_bytes);
+    // Use 32-byte big-endian representation for chainId
+    let mut chain_id_bytes = [0u8; 32];
+    chain_id.to_big_endian(&mut chain_id_bytes);
+    to_hash.extend_from_slice(&chain_id_bytes);
+    
+    let msg_hash = keccak(&to_hash);
+    let mut msg_hash_32 = [0u8; 32];
+    msg_hash_32.copy_from_slice(msg_hash.as_bytes());
+    
+    // Map hash to curve point (try-and-increment method)
+    let hash_point = map_to_curve(msg_hash_32)
+        .map_err(|e| vm::Error::InternalContract(format!("Failed to map hash to curve: {}", e)))?;
+    
+    // Compute gamma = keccak256(hash || signature || pkG1 || pkG2) mod r
+    let gamma = compute_gamma(&hash_point, &signature_point, &pk_g1, &pk_g2);
+    
+    // Pairing check: e(signature + gamma*pkG1, -G2) * e(hash + gamma*G1, pkG2) == 1
+    // P = [signature + gamma*pkG1, hash + gamma*G1]
+    // Q = [-G2, pkG2]
+    let p1 = signature_point + (pk_g1 * gamma);
+    let p2 = hash_point + (G1::one() * gamma);
+    
+    let q1 = {let mut neg_g2 = G2::one(); neg_g2 = G2::zero() - neg_g2; neg_g2};
+    let q2 = pk_g2;
+    
+    let pairing1 = pairing(p1, q1);
+    let pairing2 = pairing(p2, q2);
+    let result = pairing1 * pairing2;
+    
+    eprintln!("[DA REGISTER_EPOCH] Signature verification: valid={}", result == Gt::one());
+    
+    if result != Gt::one() {
+        return Err(vm::Error::InternalContract("Invalid epoch registration signature".to_string()));
+    }
 
     // Step 5: Mark this signer as registered for next_epoch in slot4
     // registrations[sender][next_epoch] = true
@@ -728,15 +1001,65 @@ pub fn register_signer(
         ));
     }
 
-    // Step 2: Signature verification using BN254 pairing
-    // For MVP: Skip complex signature verification
-    // TODO: Implement proper BN254 signature verification with pairing check
-    {
-        eprintln!("[DA REG] Signature verification SKIPPED for MVP");
-        eprintln!("[DA REG] Signer: {:?}", signer_addr);
-        eprintln!("[DA REG] Signature: ({}, {})", signature.0, signature.1);
-        eprintln!("[DA REG] PkG1: ({}, {})", pk_g1.0, pk_g1.1);
-        eprintln!("[DA REG] PkG2: ([{}, {}], [{}, {}])", pk_g2.0[0], pk_g2.0[1], pk_g2.1[0], pk_g2.1[1]);
+    // Step 2: BN254 signature verification using pairing check
+    // Following 0g implementation: PubkeyRegistrationHash(address, chainId, domain_string)
+    
+    // Convert signature to G1 point
+    let signature_point = u256_pair_to_g1(&signature.0, &signature.1)
+        .map_err(|e| vm::Error::InternalContract(format!("Invalid signature: {}", e)))?;
+    
+    // Convert public keys to curve points
+    let pk_g1_point = u256_pair_to_g1(&pk_g1.0, &pk_g1.1)
+        .map_err(|e| vm::Error::InternalContract(format!("Invalid pkG1: {}", e)))?;
+    let pk_g2_point = u256_quad_to_g2(&pk_g2.0[0], &pk_g2.0[1], &pk_g2.1[0], &pk_g2.1[1])
+        .map_err(|e| vm::Error::InternalContract(format!("Invalid pkG2: {}", e)))?;
+    
+    // Compute message hash: keccak256(address || chainId || "0G_BN254_Pubkey_Registration")
+    // Get chainId from environment (Conflux dev chain uses 10)
+    let chain_id = U256::from(context.env.chain_id[&cfx_types::Space::Ethereum] as u64);
+    
+    let mut to_hash = Vec::new();
+    to_hash.extend_from_slice(signer_addr.as_bytes());
+    
+    // Use 32-byte big-endian representation for chainId
+    let mut chain_id_bytes = [0u8; 32];
+    chain_id.to_big_endian(&mut chain_id_bytes);
+    to_hash.extend_from_slice(&chain_id_bytes);
+    
+    // Add domain string
+    to_hash.extend_from_slice(b"0G_BN254_Pubkey_Registration");
+    
+    let msg_hash = keccak(&to_hash);
+    let mut msg_hash_32 = [0u8; 32];
+    msg_hash_32.copy_from_slice(msg_hash.as_bytes());
+    
+    // Map hash to curve point (try-and-increment method)
+    let hash_point = map_to_curve(msg_hash_32)
+        .map_err(|e| vm::Error::InternalContract(format!("Failed to map hash to curve: {}", e)))?;
+    
+    // Compute gamma = keccak256(hash || signature || pkG1 || pkG2) mod r
+    let gamma = compute_gamma(&hash_point, &signature_point, &pk_g1_point, &pk_g2_point);
+    
+    // Pairing check: e(signature + gamma*pkG1, -G2) * e(hash + gamma*G1, pkG2) == 1
+    // This is the same formula used in 0g's ValidateSignature
+    let p1 = signature_point + (pk_g1_point * gamma);
+    let p2 = hash_point + (G1::one() * gamma);
+    
+    let q1 = {let mut neg_g2 = G2::one(); neg_g2 = G2::zero() - neg_g2; neg_g2};
+    let q2 = pk_g2_point;
+    
+    let pairing1 = pairing(p1, q1);
+    let pairing2 = pairing(p2, q2);
+    let result = pairing1 * pairing2;
+    
+    eprintln!("[DA REG] Signature verification: valid={}", result == Gt::one());
+    eprintln!("[DA REG] Signer: {:?}", signer_addr);
+    eprintln!("[DA REG] Signature: ({}, {})", signature.0, signature.1);
+    eprintln!("[DA REG] PkG1: ({}, {})", pk_g1.0, pk_g1.1);
+    eprintln!("[DA REG] PkG2: ([{}, {}], [{}, {}])", pk_g2.0[0], pk_g2.0[1], pk_g2.1[0], pk_g2.1[1]);
+    
+    if result != Gt::one() {
+        return Err(vm::Error::InternalContract("Invalid signer registration signature".to_string()));
     }
 
     // Step 3: Store signer's public key G1 component (as U256 pair)

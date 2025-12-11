@@ -35,7 +35,11 @@ pub struct SignerDetail(pub Address, pub String, pub G1Point, pub G2Point);
 // Slot 0: uint256 currentEpoch
 // Slot 1: mapping(uint256 epoch => uint256 count) quorumCountByEpoch
 // Slot 2: mapping(address signer => bool) signers
-// Slot 3: mapping(address signer => uint256) signerSocketHash
+// Slot 3: mapping(address signer => bytes) signerSocket
+//         Socket is stored across 3 consecutive slots:
+//           [0]: first 32 bytes of socket string
+//           [1]: remaining 32 bytes of socket string (if needed)
+//           [2]: socket length (uint256)
 // Slot 4: mapping(address signer => mapping(uint256 epoch => bool)) registrations
 // Slot 5: mapping(address signer => uint256[6]) signerPublicKeys
 //         where [6] contains:
@@ -81,7 +85,8 @@ fn is_signer_slot(signer: &Address) -> [u8; 32] {
     u256_to_array(mapping_slot(base, U256::from_big_endian(signer.as_bytes())))
 }
 
-/// Storage key for signer socket address (stored as hash)
+/// Storage key for signer socket address
+/// Socket is stored across 3 slots: [0] first 32 bytes, [1] next 32 bytes, [2] length
 fn signer_socket_slot(signer: &Address) -> [u8; 32] {
     let base = da_contract_base_slot() + U256::from(3);
     u256_to_array(mapping_slot(base, U256::from_big_endian(signer.as_bytes())))
@@ -981,7 +986,7 @@ pub fn register_next_epoch(
 /// 2. Signature verification 
 /// 3. Store signer's G1 public key components (X, Y coordinates)
 /// 4. Store signer's G2 public key components (X0, X1, Y0, Y1 for Fp2 elements)
-/// 5. Store socket address as keccak hash
+/// 5. Store socket address as string (max 64 bytes, using 3 slots)
 /// 6. Mark signer as active/registered
 /// 7. Emit NewSignerEvent 
 pub fn register_signer(
@@ -1098,10 +1103,10 @@ pub fn register_signer(
         pk_g2.1[1],
     ).map_err(|_| vm::Error::InternalContract("Failed to store signer pk_g2.y1".to_string()))?;
 
-    // Step 5: Store socket address as string (max 64 bytes, using 2 slots)
+    // Step 5: Store socket address as string (max 64 bytes, using 3 slots)
     // Slot 0: first 32 bytes
     // Slot 1: remaining bytes (up to 32 bytes)
-    // Simple encoding: no special markers, just raw bytes
+    // Slot 2: socket length
     let socket_bytes = socket.as_bytes();
     let socket_len = socket_bytes.len();
     
